@@ -21,7 +21,7 @@ bold "resetting tables"
 
 echo
 bold "run 1 — dies after step 2 commits"
-RATCHET_DSN="$DSN" go run ./cmd/demo -crash-after 2
+RATCHET_DSN="$DSN" ${GO:-go} run ./cmd/demo -crash-after 2
 status=$?
 [ $status -eq 1 ] || fail "expected the demo to exit 1 on the simulated crash, got $status"
 
@@ -31,7 +31,7 @@ pass "2 steps journaled, process dead"
 
 echo
 bold "run 2 — resumes from the journal"
-RATCHET_DSN="$DSN" go run ./cmd/demo -resume || fail "resume failed"
+RATCHET_DSN="$DSN" ${GO:-go} run ./cmd/demo -resume || fail "resume failed"
 
 echo
 bold "the evidence"

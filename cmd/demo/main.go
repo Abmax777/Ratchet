@@ -5,8 +5,15 @@
 // durable replay works, killing the process mid-workflow and running it again
 // leaves exactly one row per step, not two.
 //
+// Stage 1, one process:
+//
 //	go run ./cmd/demo -crash-after 2     # dies after committing step 2
 //	go run ./cmd/demo -resume            # picks up where it stopped
+//
+// Stage 2, a fleet of workers:
+//
+//	go run ./cmd/demo -enqueue 30                      # queue 30 runs
+//	go run ./cmd/demo -work -worker-id w1 -lease 3s    # start a worker (repeat in other terminals)
 package main
 
 import (
@@ -16,8 +23,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
-
+	"syscall"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -57,9 +66,14 @@ var crashAfter int
 
 func main() {
 	var (
-		dsn     = flag.String("dsn", envOr("RATCHET_DSN", "postgres://postgres@localhost:5432/ratchet?sslmode=disable"), "postgres connection string")
-		resume  = flag.Bool("resume", false, "run every unfinished workflow instead of starting a new one")
-		message = flag.String("message", "18f2a", "gmail message id to process")
+		dsn         = flag.String("dsn", envOr("RATCHET_DSN", "postgres://postgres@localhost:5432/ratchet?sslmode=disable"), "postgres connection string")
+		resume      = flag.Bool("resume", false, "run every unfinished workflow instead of starting a new one")
+		message     = flag.String("message", "18f2a", "gmail message id to process")
+		enqueue     = flag.Int("enqueue", 0, "start N workflows without running them, for workers to pick up")
+		work        = flag.Bool("work", false, "run as a worker: claim and execute queued workflows until SIGINT/SIGTERM")
+		workerID    = flag.String("worker-id", "", "worker name recorded in workflows.locked_by")
+		concurrency = flag.Int("concurrency", 3, "runs a worker executes at once")
+		lease       = flag.Duration("lease", 5*time.Second, "lease TTL for a worker's claims")
 	)
 	flag.IntVar(&crashAfter, "crash-after", 0, "simulate a crash after N steps have committed (0 = never)")
 	flag.Parse()
@@ -70,7 +84,8 @@ func main() {
 	}
 	defer db.Close()
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if err := db.PingContext(ctx); err != nil {
 		log.Fatalf("connecting to database: %v", err)
 	}
@@ -79,7 +94,39 @@ func main() {
 	engine := rt.New(pgstore.New(db))
 	rt.Register(engine, "process_email", processEmail)
 
-	if *resume {
+	switch {
+	case *enqueue > 0:
+		for i := 0; i < *enqueue; i++ {
+			id, err := engine.Start(ctx, "process_email", Input{MessageID: fmt.Sprintf("msg-%03d", i)})
+			if err != nil {
+				log.Fatalf("enqueue: %v", err)
+			}
+			fmt.Println(id)
+		}
+		return
+
+	case *work:
+		opts := rt.WorkerOptions{
+			ID:          *workerID,
+			Concurrency: *concurrency,
+			LeaseTTL:    *lease,
+			OnResult: func(id string, res rt.Result, err error) {
+				if err != nil {
+					fmt.Printf("[%s] %s %s: %v\n", *workerID, id[:8], res.Status, err)
+					return
+				}
+				fmt.Printf("[%s] %s %s (executed %d, replayed %d)\n", *workerID, id[:8], res.Status, res.Executed, res.Replayed)
+			},
+			OnError: func(err error) { log.Print(err) },
+		}
+		fmt.Printf("[%s] working, lease %s, concurrency %d\n", *workerID, *lease, *concurrency)
+		if err := engine.Work(ctx, opts); err != nil {
+			log.Fatalf("worker: %v", err)
+		}
+		fmt.Printf("[%s] stopped cleanly\n", *workerID)
+		return
+
+	case *resume:
 		ids, err := engine.RunPending(ctx)
 		if err != nil {
 			log.Fatalf("resume: %v", err)
@@ -107,32 +154,53 @@ func main() {
 	fmt.Printf("workflow %s %s  (executed %d, replayed %d)\n", id, res.Status, res.Executed, res.Replayed)
 }
 
-// TASK 9 — write the workflow.
+// processEmail is the workflow (task 9): three steps, each wrapped in rt.Step.
 //
-// This is the user-facing side of the runtime: what it feels like to USE the
-// thing you built. Three steps, in this order, each wrapped in rt.Step:
+// The function is re-executed from the top on every resume. Each rt.Step that
+// already has a journal entry returns the recorded value without running its
+// function, so only unfinished work happens again.
 //
-//	fetch_email  -> call record(c, "fetch_email"), sleep ~300ms, return an email
-//	classify     -> call record(c, "classify"), sleep ~600ms, return classify(msg)
-//	write_row    -> call record(c, "write_row"), sleep ~200ms, return struct{}{}
-//
-// Between them, call maybeCrash(1), maybeCrash(2) and maybeCrash(3) — that is
-// what lets the crash test kill the process at a chosen point.
-//
-// Somewhere before write_row, get the timestamp for the Output. Use rt.Now, not
-// time.Now, and make sure you understand the difference before you type it: one
-// of them makes this function replay identically and the other quietly breaks
-// it. The names in the rt.Step calls must match the ones above, because
-// scripts/crash_test.sh reads them back out of the journal.
-//
-// The sleeps are not decoration. They stand in for a real API call and a real
-// LLM call, and they make the crash test's timing legible when you watch it run.
-//
-// You will need to add imports as you go — "time" for the sleeps, for a start.
-//
-// See TUTORIAL part 7, and LEARNING.md task 9.
+// The timestamp comes from rt.Now, not time.Now. time.Now would return a new
+// value on every replay, so the output would change depending on when the
+// resume happened; rt.Now journals the first value and returns it forever.
+// It sits after maybeCrash(2) so that a crash after step 2 leaves exactly two
+// journal rows, which is what the crash test checks.
 func processEmail(c *rt.Context, in Input) (Output, error) {
-	panic("TODO(task 9): write the workflow — see LEARNING.md")
+	msg, err := rt.Step(c, "fetch_email", func() (email, error) {
+		record(c, "fetch_email")
+		time.Sleep(300 * time.Millisecond) // stands in for the Gmail API
+		return email{From: "talent@example.com", Subject: "Your application for message " + in.MessageID}, nil
+	})
+	if err != nil {
+		return Output{}, err
+	}
+	maybeCrash(1)
+
+	cls, err := rt.Step(c, "classify", func() (classification, error) {
+		record(c, "classify")
+		time.Sleep(600 * time.Millisecond) // stands in for the LLM call
+		return classify(msg), nil
+	})
+	if err != nil {
+		return Output{}, err
+	}
+	maybeCrash(2)
+
+	at, err := rt.Now(c)
+	if err != nil {
+		return Output{}, err
+	}
+
+	if _, err := rt.Step(c, "write_row", func() (struct{}, error) {
+		record(c, "write_row")
+		time.Sleep(200 * time.Millisecond) // stands in for the tracker write
+		return struct{}{}, nil
+	}); err != nil {
+		return Output{}, err
+	}
+	maybeCrash(3)
+
+	return Output{Label: cls.Label, Company: cls.Company, WrittenAt: at.Format(time.RFC3339)}, nil
 }
 
 // record appends to the observation table and logs, so the crash test can count
